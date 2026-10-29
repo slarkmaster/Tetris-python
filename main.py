@@ -13,10 +13,12 @@ Run:
 
 The Game class holds the rules (movement, rotation, line clears, score).
 main() is the Pygame loop: read keys, update the game, draw the screen.
+Press B, or the mode buttons, to switch between Player Mode and Bot Mode.
 """
 
 import json
 import random
+from collections import deque
 from pathlib import Path
 
 import pygame
@@ -50,10 +52,9 @@ FALL_SPEED_FACTOR = 0.85
 MIN_FALL_MS = 60
 LINES_PER_LEVEL = 10
 
-# Holding Left or Right: wait DAS_DELAY_MS, then repeat every MOVE_REPEAT_MS.
-# That way a tap moves one square and holding the key slides.
-DAS_DELAY_MS = 170
-MOVE_REPEAT_MS = 45
+# A tap moves one square. Holding Left or Right past this sends the piece
+# the rest of the way to that side.
+HOLD_TO_WALL_MS = 500
 # After the piece lands it can still slide or rotate for this long, then it
 # sticks. Down and Space skip the wait and place the piece immediately.
 LOCK_DELAY_MS = 500
@@ -381,6 +382,8 @@ class Game:
     def __init__(self, rng=None, bindings=None):
         self.rng = rng or random.Random()
         self.bindings = bindings if bindings is not None else KeyBindings()
+        self.mode = "player"
+        self.bot = BotController()
         self.restart()
 
     def restart(self):
@@ -396,13 +399,24 @@ class Game:
         self.bag = SevenBag(self.rng)
         self.piece = None
         self.release_inputs()
+        self.bot.cancel()
         self._spawn()
+
+    def set_mode(self, mode):
+        """Switch between player and bot control. Pending bot moves are dropped."""
+        if mode not in ("player", "bot") or mode == self.mode:
+            return
+        self.mode = mode
+        self.release_inputs()
+        self.bot.cancel()
+        self.bot.sync_status(self)
 
     def release_inputs(self):
         """Forget held keys, so the piece stops if the window loses focus."""
         self.hold_left = False
         self.hold_right = False
-        self.horiz_timer = DAS_DELAY_MS
+        self.horiz_timer = HOLD_TO_WALL_MS
+        self.horiz_dashed = False
 
     def coming_next(self):
         """The piece that will spawn after this one locks."""
@@ -501,13 +515,22 @@ class Game:
 
     def _slide(self, dt):
         if self.hold_left == self.hold_right:
-            self.horiz_timer = DAS_DELAY_MS
+            self.horiz_timer = HOLD_TO_WALL_MS
+            self.horiz_dashed = False
+            return
+        if self.horiz_dashed:
             return
         self.horiz_timer -= dt
         if self.horiz_timer > 0:
             return
-        self.horiz_timer = MOVE_REPEAT_MS
-        self.try_move(-1 if self.hold_left else 1, 0)
+        self.horiz_dashed = True
+        self._slide_to_wall(-1 if self.hold_left else 1)
+
+    def _slide_to_wall(self, dx):
+        """Move until a wall or a filled cell blocks this direction."""
+        while self.try_move(dx, 0):
+            pass
+
 
     def _gravity(self, dt):
         self.fall_ms += dt
@@ -561,14 +584,19 @@ class Game:
             return
         if self.paused or self.game_over or action is None:
             return
+        # Bot Mode owns the falling piece. Pause and restart still work above.
+        if self.mode == "bot" and action in ("move_left", "move_right", "rotate", "rotate_back", "drop"):
+            return
 
         if action == "move_left":
             self.hold_left = True
-            self.horiz_timer = DAS_DELAY_MS
+            self.horiz_timer = HOLD_TO_WALL_MS
+            self.horiz_dashed = False
             self.try_move(-1, 0)
         elif action == "move_right":
             self.hold_right = True
-            self.horiz_timer = DAS_DELAY_MS
+            self.horiz_timer = HOLD_TO_WALL_MS
+            self.horiz_dashed = False
             self.try_move(1, 0)
         elif action == "drop":
             self.hard_drop()
@@ -583,6 +611,291 @@ class Game:
             self.hold_left = False
         elif action == "move_right":
             self.hold_right = False
+
+
+# Tunable scores for Bot Mode. Positive weights reward, negative weights penalize.
+# Lines are worth more than one buried hole, and a stack near the ceiling is costly.
+BOT_WEIGHTS = {
+    "lines": 100.0,
+    "holes": -55.0,
+    "aggregate_height": -1.5,
+    "bumpiness": -3.5,
+    "danger": -4.0,
+}
+
+BOT_STEP_MIN_MS = 30
+BOT_STEP_MAX_MS = 200
+BOT_STEP_MS = 80
+
+
+def shape_cells(kind, rotation, x, y):
+    """Board squares for a piece pose. Does not touch the live game."""
+    return [(x + cx, y + cy) for cx, cy in SHAPES[kind][rotation]]
+
+
+def column_heights(board):
+    """How far each column reaches up from the floor. Empty columns are 0."""
+    heights = []
+    for x in range(COLS):
+        height = 0
+        for y in range(ROWS):
+            if board[y][x] is not None:
+                height = ROWS - y
+                break
+        heights.append(height)
+    return heights
+
+
+def count_holes(board, heights):
+    """Empty cells with at least one filled cell above them."""
+    holes = 0
+    for x, height in enumerate(heights):
+        if height == 0:
+            continue
+        top = ROWS - height
+        for y in range(top + 1, ROWS):
+            if board[y][x] is None:
+                holes += 1
+    return holes
+
+
+def evaluate_board(board, lines_cleared, weights):
+    """Score a simulated board. Higher is better. The live board is not used."""
+    heights = column_heights(board)
+    holes = count_holes(board, heights)
+    aggregate = sum(heights)
+    bumpiness = sum(abs(heights[i] - heights[i + 1]) for i in range(COLS - 1))
+    peak = max(heights) if heights else 0
+    # Extra cost once the stack enters the top four rows, where a spawn can die.
+    danger = peak
+    if peak >= ROWS - 4:
+        danger += (peak - (ROWS - 5)) * 8
+    return (
+        weights["lines"] * lines_cleared
+        + weights["holes"] * holes
+        + weights["aggregate_height"] * aggregate
+        + weights["bumpiness"] * bumpiness
+        + weights["danger"] * danger
+    )
+
+
+def pose_neighbors(board, kind, rotation, x, y):
+    """Legal left, right, and rotation steps from this pose, using the game's kicks."""
+    steps = []
+    for dx, name in ((-1, "left"), (1, "right")):
+        if cells_fit(board, shape_cells(kind, rotation, x + dx, y)):
+            steps.append((name, (rotation, x + dx, y)))
+    for direction, name in ((1, "cw"), (-1, "ccw")):
+        new_rotation = (rotation + direction) % 4
+        for kick_x, kick_y in KICKS:
+            next_x = x + kick_x
+            next_y = y + kick_y
+            if cells_fit(board, shape_cells(kind, new_rotation, next_x, next_y)):
+                steps.append((name, (new_rotation, next_x, next_y)))
+                break
+    return steps
+
+
+def drop_y(board, kind, rotation, x, y):
+    """Lowest row this pose can fall to. None when the pose itself does not fit."""
+    if not cells_fit(board, shape_cells(kind, rotation, x, y)):
+        return None
+    while cells_fit(board, shape_cells(kind, rotation, x, y + 1)):
+        y += 1
+    return y
+
+
+def simulate_placement(board, kind, cells):
+    """Copy the board, lock these cells, and clear lines. The original board stays put."""
+    simulated = [row[:] for row in board]
+    for x, y in cells:
+        simulated[y][x] = kind
+    return clear_lines(simulated)
+
+
+def choose_move(board, piece, weights=None):
+    """Pick a legal path of left, right, rotate, and a final drop for this piece.
+
+    Search only poses reachable by the same moves Player Mode uses, then hard-drop
+    each one on a copy of the board. The returned path is empty when nothing fits.
+    """
+    weights = BOT_WEIGHTS if weights is None else weights
+    start = (piece.rotation, piece.x, piece.y)
+    if not cells_fit(board, shape_cells(piece.kind, *start)):
+        return None
+
+    best = None
+    seen = {start}
+    queue = deque([(start, [])])
+    while queue:
+        (rotation, x, y), path = queue.popleft()
+        landing = drop_y(board, piece.kind, rotation, x, y)
+        if landing is not None:
+            cells = shape_cells(piece.kind, rotation, x, landing)
+            simulated, cleared = simulate_placement(board, piece.kind, cells)
+            score = evaluate_board(simulated, cleared, weights)
+            # Equal scores prefer the shorter path, then the lower landing.
+            rank = (score, -len(path), landing)
+            if best is None or rank > best[0]:
+                best = (rank, path + ["drop"])
+        for name, pose in pose_neighbors(board, piece.kind, rotation, x, y):
+            if pose in seen:
+                continue
+            seen.add(pose)
+            queue.append((pose, path + [name]))
+    if best is None:
+        return None
+    return best[1]
+
+
+class BotController:
+    """Runs a planned path one step at a time through the normal game rules.
+
+    A new piece gets one plan. Pause, reset, game over, and leaving Bot Mode
+    throw that plan away so a later tick cannot move the wrong piece.
+    """
+
+    def __init__(self, weights=None, step_ms=BOT_STEP_MS):
+        self.weights = BOT_WEIGHTS if weights is None else weights
+        self.step_ms = step_ms
+        self.status = "idle"
+        self.actions = []
+        self.piece_id = None
+        self.timer = 0
+        self.waiting = False
+        self.replans = 0
+        self.gave_up_id = None
+        self.tracked_id = None
+        self.player_rect = None
+        self.bot_rect = None
+        self.slower_rect = None
+        self.faster_rect = None
+
+    def cancel(self):
+        """Forget any move that has not been played yet."""
+        self.actions = []
+        self.piece_id = None
+        self.tracked_id = None
+        self.timer = 0
+        self.waiting = False
+        self.replans = 0
+        self.gave_up_id = None
+        if self.status not in ("paused", "game over"):
+            self.status = "idle"
+
+    def sync_status(self, game):
+        if game.game_over:
+            self.status = "game over"
+        elif game.paused and game.mode == "bot":
+            self.status = "paused"
+        elif game.mode != "bot":
+            self.status = "idle"
+
+    def display_status(self, game):
+        if game.game_over:
+            return "Game over"
+        if game.paused and game.mode == "bot":
+            return "Paused"
+        if game.mode != "bot":
+            return "Idle"
+        return {
+            "idle": "Idle",
+            "thinking": "Thinking",
+            "moving": "Moving",
+            "dropping": "Dropping",
+            "paused": "Paused",
+            "game over": "Game over",
+        }.get(self.status, "Idle")
+
+    def slower(self):
+        self.step_ms = min(BOT_STEP_MAX_MS, self.step_ms + 20)
+
+    def faster(self):
+        self.step_ms = max(BOT_STEP_MIN_MS, self.step_ms - 20)
+
+    def update(self, game, dt):
+        """Advance the bot by dt milliseconds. Does nothing unless Bot Mode is active."""
+        if game.mode != "bot":
+            return
+        if game.game_over:
+            self.cancel()
+            self.status = "game over"
+            return
+        if game.paused:
+            self.cancel()
+            self.status = "paused"
+            return
+        piece = game.piece
+        if piece is None:
+            self.status = "idle"
+            return
+        piece_id = id(piece)
+        if self.gave_up_id == piece_id:
+            self.status = "idle"
+            return
+        if self.tracked_id != piece_id:
+            # New piece. Wait one step so this plan cannot belong to the previous one.
+            self.tracked_id = piece_id
+            self.timer = 0
+            self.waiting = True
+            self.replans = 0
+            self.actions = []
+            self.status = "thinking"
+            return
+
+        self.timer += dt
+        if self.timer < self.step_ms:
+            self.status = "thinking" if self.waiting else self.status
+            return
+        self.timer -= self.step_ms
+        self.waiting = False
+        # Search again at the moment of the move so gravity cannot leave a stale path.
+        path = choose_move(game.board, piece, self.weights)
+        if not path:
+            self.gave_up_id = piece_id
+            self.actions = []
+            self.status = "idle"
+            return
+        action = path[0]
+        self.actions = [action]
+        self.status = "dropping" if action == "drop" else "moving"
+        applied = self._apply(game, action)
+        if game.game_over:
+            self.cancel()
+            self.status = "game over"
+            return
+        if game.piece is None or id(game.piece) != piece_id:
+            self.actions = []
+            self.tracked_id = None
+            self.timer = 0
+            self.waiting = False
+            self.status = "idle"
+            return
+        if not applied:
+            self.replans += 1
+            self.actions = []
+            if self.replans > 3:
+                self.gave_up_id = piece_id
+                self.status = "idle"
+            return
+        self.replans = 0
+
+    def _apply(self, game, action):
+        """Play one planned step with the same functions the keyboard uses."""
+        if game.game_over or game.paused or game.piece is None:
+            return False
+        if action == "left":
+            return game.try_move(-1, 0)
+        if action == "right":
+            return game.try_move(1, 0)
+        if action == "cw":
+            return game.try_rotate(1)
+        if action == "ccw":
+            return game.try_rotate(-1)
+        if action == "drop":
+            game.hard_drop()
+            return True
+        return False
 
 
 def shade(color, amount):
@@ -781,7 +1094,8 @@ def draw_sidebar(surface, game, fonts, settings):
 
     tag = fonts["tag"].render("Clear a full line and it disappears.", True, MUTED)
     surface.blit(tag, (x, y))
-    y += tag.get_height() + 16
+    y += tag.get_height() + 10
+    y = draw_mode_bar(surface, game, fonts, y)
 
     stats = pygame.Rect(x, y, PANEL_W, 132)
     draw_panel(surface, stats)
@@ -811,7 +1125,7 @@ def draw_sidebar(surface, game, fonts, settings):
     surface.blit(hint, hint.get_rect(center=(stats.centerx, stats.bottom - 18)))
     y = stats.bottom + 14
 
-    nxt = pygame.Rect(x, y, PANEL_W, 148)
+    nxt = pygame.Rect(x, y, PANEL_W, 116)
     draw_panel(surface, nxt)
     next_label = fonts["section"].render("NEXT", True, MUTED)
     surface.blit(next_label, (nxt.x + 18, nxt.y + 12))
@@ -819,7 +1133,7 @@ def draw_sidebar(surface, game, fonts, settings):
     draw_shape_preview(surface, game.coming_next(), preview)
     y = nxt.bottom + 14
 
-    help_panel = pygame.Rect(x, y, PANEL_W, 208)
+    help_panel = pygame.Rect(x, y, PANEL_W, 176)
     draw_panel(surface, help_panel)
     heading = fonts["section"].render("HOW TO PLAY", True, ACCENT)
     surface.blit(heading, (help_panel.x + 18, help_panel.y + 12))
@@ -856,6 +1170,45 @@ def draw_sidebar(surface, game, fonts, settings):
         row_y += 28
     hint = fonts["small"].render("K opens keyboard settings", True, MUTED)
     surface.blit(hint, (help_panel.x + 18, row_y + 2))
+
+
+def draw_mode_bar(surface, game, fonts, y):
+    """Player / Bot switch, bot status, and the bot's step delay."""
+    panel = pygame.Rect(SIDE_X, y, PANEL_W, 74)
+    draw_panel(surface, panel)
+    mode_label = fonts["section"].render("MODE", True, MUTED)
+    surface.blit(mode_label, (panel.x + 18, panel.y + 10))
+    status = fonts["small"].render(f"Bot {game.bot.display_status(game)}", True, TEXT)
+    surface.blit(status, status.get_rect(right=panel.right - 18, centery=panel.y + 18))
+
+    def pill(text, selected, left):
+        image = fonts["section"].render(text, True, BG if selected else ACCENT)
+        rect = image.get_rect(topleft=(left, panel.y + 38))
+        background = rect.inflate(20, 10)
+        pygame.draw.rect(surface, ACCENT if selected else (36, 44, 68), background, border_radius=8)
+        surface.blit(image, image.get_rect(center=background.center))
+        return background
+
+    game.bot.player_rect = pill("PLAYER", game.mode == "player", panel.x + 18)
+    game.bot.bot_rect = pill("BOT", game.mode == "bot", game.bot.player_rect.right + 18)
+
+    faster = fonts["section"].render("+", True, ACCENT)
+    faster_rect = faster.get_rect(topright=(panel.right - 24, panel.y + 40))
+    faster_bg = faster_rect.inflate(16, 8)
+    pygame.draw.rect(surface, (36, 44, 68), faster_bg, border_radius=8)
+    surface.blit(faster, faster.get_rect(center=faster_bg.center))
+    game.bot.faster_rect = faster_bg
+
+    slower = fonts["section"].render("-", True, ACCENT)
+    slower_rect = slower.get_rect(topright=(faster_bg.left - 8, panel.y + 40))
+    slower_bg = slower_rect.inflate(16, 8)
+    pygame.draw.rect(surface, (36, 44, 68), slower_bg, border_radius=8)
+    surface.blit(slower, slower.get_rect(center=slower_bg.center))
+    game.bot.slower_rect = slower_bg
+
+    speed = fonts["small"].render(f"{game.bot.step_ms} ms", True, MUTED)
+    surface.blit(speed, speed.get_rect(midright=(slower_bg.left - 8, slower_bg.centery)))
+    return panel.bottom + 12
 
 
 def draw_status(surface, game, fonts):
@@ -979,17 +1332,34 @@ def main():
                     running = False
                 elif event.key == pygame.K_k:
                     settings.toggle(game)
+                elif event.key == pygame.K_b and game.bindings.action_for(event.key) is None:
+                    game.set_mode("player" if game.mode == "bot" else "bot")
+                elif event.key == pygame.K_LEFTBRACKET and game.bindings.action_for(event.key) is None:
+                    game.bot.slower()
+                elif event.key == pygame.K_RIGHTBRACKET and game.bindings.action_for(event.key) is None:
+                    game.bot.faster()
                 else:
                     game.handle_key_down(event.key)
             elif event.type == pygame.KEYUP:
                 game.handle_key_up(event.key)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                point = event.pos
                 rect = settings.keyboard_rect
-                if rect is not None and rect.collidepoint(event.pos):
+                if rect is not None and rect.collidepoint(point):
                     settings.toggle(game)
+                elif game.bot.player_rect is not None and game.bot.player_rect.collidepoint(point):
+                    game.set_mode("player")
+                elif game.bot.bot_rect is not None and game.bot.bot_rect.collidepoint(point):
+                    game.set_mode("bot")
+                elif game.bot.slower_rect is not None and game.bot.slower_rect.collidepoint(point):
+                    game.bot.slower()
+                elif game.bot.faster_rect is not None and game.bot.faster_rect.collidepoint(point):
+                    game.bot.faster()
 
         if not settings.open:
             game.update(dt)
+            if game.mode == "bot":
+                game.bot.update(game, dt)
         draw(screen, game, fonts, settings)
         pygame.display.flip()
 
