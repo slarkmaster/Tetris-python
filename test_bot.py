@@ -217,5 +217,145 @@ class BotPlayTests(unittest.TestCase):
         return locks
 
 
+class VersusTests(unittest.TestCase):
+    def test_both_boards_start_on_the_same_piece_sequence(self):
+        versus = main.Versus(main.KeyBindings("/tmp/tetris-versus-controls.json"))
+        self.assertEqual(versus.player.piece.kind, versus.opponent.piece.kind)
+        self.assertEqual(versus.player.coming_next(), versus.opponent.coming_next())
+        self.assertEqual(versus.opponent.mode, "bot")
+        self.assertIsNone(versus.winner())
+
+    def test_attack_table_matches_cleared_lines(self):
+        self.assertEqual(main.ATTACK_LINES[1], 0)
+        self.assertEqual(main.ATTACK_LINES[2], 2)
+        self.assertEqual(main.ATTACK_LINES[3], 3)
+        self.assertEqual(main.ATTACK_LINES[4], 4)
+
+    def test_garbage_rises_from_the_bottom_then_settles(self):
+        game = new_game()
+        game.add_garbage(2)
+        cell = 22
+        self.assertAlmostEqual(game.garbage_rise_pixels(cell), 2 * cell)
+        game.tick_garbage_rise(main.GARBAGE_RISE_MS)
+        self.assertAlmostEqual(game.garbage_rise_pixels(cell), cell)
+        game.tick_garbage_rise(main.GARBAGE_RISE_MS)
+        self.assertEqual(game.garbage_rise_pixels(cell), 0)
+        self.assertEqual(game.piece_rise_pixels(cell), 0)
+        screen = pygame.display.set_mode((main.WINDOW_WIDTH, main.WINDOW_HEIGHT))
+        game.add_garbage(3)
+        main.draw_board(screen, game, 16, 52, cell)
+        game.tick_garbage_rise(main.GARBAGE_RISE_MS * 1.5)
+        main.draw_board(screen, game, 16, 52, cell)
+
+    def test_garbage_rows_have_one_gap_and_drop_the_falling_piece(self):
+        game = new_game()
+        old = game.piece
+        old_kind = old.kind
+        game.piece.y = 10
+        game.add_garbage(2)
+        self.assertFalse(game.game_over)
+        self.assertIsNotNone(game.piece)
+        self.assertIsNot(game.piece, old)
+        self.assertTrue(main.cells_fit(game.board, game.piece.cells()))
+        self.assertLess(game.piece.y, 4)
+        self.assertFalse(any(cell == old_kind for row in game.board for cell in row))
+        junk = [row for row in game.board if any(cell == "G" for cell in row)]
+        self.assertEqual(len(junk), 2)
+        for row in junk:
+            self.assertEqual(row.count(None), 1)
+            self.assertEqual(row.count("G"), main.COLS - 1)
+
+    def test_same_step_attacks_cancel(self):
+        left = new_game(1)
+        right = new_game(2)
+        left.outgoing_attack = 4
+        right.outgoing_attack = 1
+        before = snapshot(left.board)
+        main.exchange_attacks(left, right)
+        self.assertEqual(snapshot(left.board), before)
+        junk = [row for row in right.board if any(cell == "G" for cell in row)]
+        self.assertEqual(len(junk), 3)
+        left.outgoing_attack = 2
+        right.outgoing_attack = 2
+        main.exchange_attacks(left, right)
+        self.assertEqual(len([row for row in right.board if any(cell == "G" for cell in row)]), 3)
+
+    def test_clearing_lines_queues_an_attack(self):
+        game = new_game()
+        for x in range(4, main.COLS):
+            game.board[main.ROWS - 1][x] = "I"
+        game.piece = main.Piece("I")
+        game.piece.x = 0
+        game.hard_drop()
+        self.assertGreaterEqual(game.lines, 1)
+        self.assertEqual(game.outgoing_attack, main.ATTACK_LINES[game.lines])
+
+    def test_garbage_flies_then_lands(self):
+        versus = main.Versus(main.KeyBindings("/tmp/tetris-versus-controls.json"))
+        versus.player.outgoing_attack = 3
+        versus.update(1)
+        flight = versus.flights[0]
+        self.assertEqual(flight.count, 3)
+        self.assertTrue(flight.from_left)
+        self.assertLess(flight.progress(), 0.05)
+        versus.update(main.GARBAGE_FLIGHT_MS / 2)
+        self.assertGreater(flight.progress(), 0.4)
+        self.assertLess(flight.progress(), 1)
+        self.assertEqual(filled_cells(versus.opponent.board), 0)
+        versus.update(main.GARBAGE_FLIGHT_MS)
+        self.assertEqual(versus.flights, [])
+        junk = [row for row in versus.opponent.board if any(cell == "G" for cell in row)]
+        self.assertEqual(len(junk), 3)
+        screen = pygame.display.set_mode((main.WINDOW_WIDTH, main.WINDOW_HEIGHT))
+        versus.player.outgoing_attack = 2
+        versus.update(1)
+        versus.update(main.GARBAGE_FLIGHT_MS / 3)
+        fonts = main.make_fonts()
+        session = main.Session(versus.bindings)
+        session.mode = "versus"
+        session.versus = versus
+        settings = main.KeyboardSettings(versus.bindings)
+        main.draw_versus(screen, session, fonts, settings)
+
+    def test_player_keys_do_not_move_the_bot_board(self):
+        versus = main.Versus(main.KeyBindings("/tmp/tetris-versus-controls.json"))
+        bot_x = versus.opponent.piece.x
+        versus.player.handle_key_down(pygame.K_LEFT)
+        self.assertEqual(versus.opponent.piece.x, bot_x)
+        self.assertEqual(versus.player.piece.x, main.SPAWN_X - 1)
+
+    def test_match_plays_and_restart_clears_both_boards(self):
+        versus = main.Versus(main.KeyBindings("/tmp/tetris-versus-controls.json"))
+        versus.opponent.bot.step_ms = 40
+        for _ in range(30):
+            versus.update(40)
+        self.assertIsNone(versus.winner())
+        versus.player.outgoing_attack = 4
+        def junk():
+            return sum(cell == "G" for row in versus.opponent.board for cell in row)
+        before = junk()
+        versus.update(1)
+        self.assertEqual(len(versus.flights), 1)
+        self.assertEqual(junk(), before)
+        versus.update(main.GARBAGE_FLIGHT_MS)
+        self.assertGreater(junk(), before)
+        self.assertEqual(versus.flights, [])
+        versus.restart()
+        self.assertEqual(versus.flights, [])
+        self.assertEqual(filled_cells(versus.player.board), 0)
+        self.assertEqual(filled_cells(versus.opponent.board), 0)
+        self.assertFalse(versus.player.game_over)
+        self.assertFalse(versus.opponent.game_over)
+        self.assertEqual(versus.player.piece.kind, versus.opponent.piece.kind)
+
+    def test_top_out_names_the_winner_and_stops_play(self):
+        versus = main.Versus(main.KeyBindings("/tmp/tetris-versus-controls.json"))
+        versus.player.game_over = True
+        piece = versus.opponent.piece.x
+        versus.update(500)
+        self.assertEqual(versus.winner(), "bot")
+        self.assertEqual(versus.opponent.piece.x, piece)
+
+
 if __name__ == "__main__":
     unittest.main()
